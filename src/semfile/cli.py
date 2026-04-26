@@ -20,6 +20,22 @@ from semfile.search.searcher import Searcher
 from semfile.store.chromadb_store import ChromaStore
 
 
+def _dir_size(path: Path) -> int:
+    """Return total size in bytes of all files under a directory."""
+    if not path.exists():
+        return 0
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def _fmt_bytes(n: int) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -52,10 +68,13 @@ def main(ctx: click.Context, config_path: str | None, verbose: bool) -> None:
 
 @main.command()
 @click.option("--path", "target_path", default=None, help="Index a specific directory or file.")
+@click.option("--type", "file_types", multiple=True, help="Only index these file types (image, video, audio, document, text).")
 @click.pass_context
-def index(ctx: click.Context, target_path: str | None) -> None:
+def index(ctx: click.Context, target_path: str | None, file_types: tuple[str, ...]) -> None:
     """Index files for semantic search."""
     config, provider, store = _load(ctx.obj["config_path"])
+
+    type_filter = set(file_types) if file_types else None
 
     if not config.watch_dirs and not target_path:
         click.echo("No watch directories configured. Use --path or edit config.")
@@ -69,10 +88,10 @@ def index(ctx: click.Context, target_path: str | None) -> None:
 
     if target_path:
         click.echo(f"Indexing: {target_path}")
-        stats = indexer.index_path(Path(target_path))
+        stats = indexer.index_path(Path(target_path), file_types=type_filter)
     else:
         click.echo(f"Indexing {len(config.watch_dirs)} watch directories...")
-        stats = indexer.index_all()
+        stats = indexer.index_all(file_types=type_filter)
 
     click.echo(
         f"Done. Scanned: {stats['scanned']}, Indexed: {stats['indexed']}, "
@@ -131,8 +150,13 @@ def status(ctx: click.Context) -> None:
         for file_type, count in sorted(counts.items()):
             click.echo(f"  {file_type}: {count}")
 
-    click.echo(f"\nDB path: {config.db_path}")
-    click.echo(f"Thumbnail dir: {config.thumbnail_dir}")
+    # Storage sizes
+    db_size = _dir_size(config.db_path)
+    thumb_size = _dir_size(config.thumbnail_dir)
+    total_size = db_size + thumb_size
+    click.echo(f"\nStorage: {_fmt_bytes(total_size)}")
+    click.echo(f"  Database: {_fmt_bytes(db_size)} ({config.db_path})")
+    click.echo(f"  Thumbnails: {_fmt_bytes(thumb_size)} ({config.thumbnail_dir})")
     click.echo(f"Embedding dimensions: {config.embedding_dimensions}")
 
     if config.watch_dirs:

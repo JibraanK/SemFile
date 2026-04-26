@@ -26,7 +26,7 @@ class Indexer:
         self.provider = provider
         self.store = store
 
-    def index_all(self) -> dict[str, int]:
+    def index_all(self, file_types: set[str] | None = None) -> dict[str, int]:
         """Index all configured watch directories. Returns stats."""
         stats = {"scanned": 0, "indexed": 0, "skipped": 0, "failed": 0, "removed": 0}
 
@@ -34,17 +34,23 @@ class Indexer:
         for watch_dir in self.config.watch_dirs:
             all_files.extend(scan_directory(watch_dir))
 
+        if file_types:
+            all_files = [(p, ft, mt) for p, ft, mt in all_files if ft in file_types]
+
         stats["scanned"] = len(all_files)
         self._index_files(all_files, stats)
         self._cleanup_removed(all_files, stats)
 
         return stats
 
-    def index_path(self, path: Path, extensions: set[str] | None = None) -> dict[str, int]:
+    def index_path(self, path: Path, extensions: set[str] | None = None, file_types: set[str] | None = None) -> dict[str, int]:
         """Index a specific path. Returns stats."""
         stats = {"scanned": 0, "indexed": 0, "skipped": 0, "failed": 0, "removed": 0}
 
         files = scan_path(path, extensions)
+        if file_types:
+            files = [(p, ft, mt) for p, ft, mt in files if ft in file_types]
+
         stats["scanned"] = len(files)
         self._index_files(files, stats)
 
