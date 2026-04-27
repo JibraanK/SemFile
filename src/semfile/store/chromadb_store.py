@@ -39,6 +39,7 @@ class SearchResult:
     file_size: int
     thumbnail_path: str
     distance: float
+    rerank_score: float | None = None
 
 
 def _file_id(file_path: str) -> str:

@@ -16,6 +16,7 @@ from semfile.config import (
 )
 from semfile.embeddings.gemini import GeminiEmbeddingProvider
 from semfile.indexer.indexer import Indexer
+from semfile.rerank.gemini import GeminiReranker
 from semfile.search.searcher import Searcher
 from semfile.store.chromadb_store import ChromaStore
 
@@ -105,8 +106,18 @@ def index(ctx: click.Context, target_path: str | None, file_types: tuple[str, ..
 @click.option("--type", "file_type", multiple=True, help="Filter by file type (image, video, audio, document, text).")
 @click.option("--dir", "directories", multiple=True, help="Scope search to specific directories.")
 @click.option("--limit", default=20, help="Maximum number of results.")
+@click.option("--rerank", is_flag=True, help="Use multimodal reranker (Gemini 2.5 Flash) for higher-quality matches.")
+@click.option("--rerank-top-n", default=20, help="Number of candidates to rerank when --rerank is set (default 20).")
 @click.pass_context
-def search(ctx: click.Context, query: str, file_type: tuple[str, ...], directories: tuple[str, ...], limit: int) -> None:
+def search(
+    ctx: click.Context,
+    query: str,
+    file_type: tuple[str, ...],
+    directories: tuple[str, ...],
+    limit: int,
+    rerank: bool,
+    rerank_top_n: int,
+) -> None:
     """Search indexed files by natural language query."""
     config, provider, store = _load(ctx.obj["config_path"])
 
@@ -114,12 +125,15 @@ def search(ctx: click.Context, query: str, file_type: tuple[str, ...], directori
         click.echo("No files indexed yet. Run `semfile index` first.")
         return
 
-    searcher = Searcher(provider, store)
+    reranker = GeminiReranker() if rerank else None
+    searcher = Searcher(provider, store, reranker=reranker)
     results = searcher.search(
         query=query,
         limit=limit,
         file_types=list(file_type) if file_type else None,
         directories=list(directories) if directories else None,
+        rerank=rerank,
+        rerank_top_n=rerank_top_n,
     )
 
     if not results:
@@ -132,7 +146,11 @@ def search(ctx: click.Context, query: str, file_type: tuple[str, ...], directori
         size_mb = r.file_size / 1_000_000
         click.echo(f"  {i}. [{r.file_type}] {r.filename}")
         click.echo(f"     Path: {r.file_path}")
-        click.echo(f"     Similarity: {similarity:.3f}  Size: {size_mb:.1f} MB")
+        line = f"     Similarity: {similarity:.3f}"
+        if r.rerank_score is not None:
+            line += f"  Rerank: {r.rerank_score:.2f}"
+        line += f"  Size: {size_mb:.1f} MB"
+        click.echo(line)
         click.echo()
 
 
