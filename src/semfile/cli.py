@@ -231,6 +231,61 @@ def show_config(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.argument("paths", nargs=-1, type=click.Path(path_type=Path))
+@click.option(
+    "--dir",
+    "directories",
+    multiple=True,
+    type=click.Path(path_type=Path),
+    help="Remove every indexed file under a directory (prefix match). Repeatable.",
+)
+@click.option("-y", "--yes", is_flag=True, help="Skip the confirmation prompt.")
+@click.pass_context
+def remove(
+    ctx: click.Context,
+    paths: tuple[Path, ...],
+    directories: tuple[Path, ...],
+    yes: bool,
+) -> None:
+    """Remove specific indexed files from the database (does not touch disk)."""
+    if not paths and not directories:
+        raise click.UsageError("Provide one or more PATHS and/or --dir DIR.")
+
+    _, _, store = _load(ctx.obj["config_path"])
+    all_paths = store.get_all_paths()
+
+    targets: set[str] = set()
+    for p in paths:
+        resolved = str(p.expanduser().resolve())
+        if resolved in all_paths:
+            targets.add(resolved)
+
+    if directories:
+        resolved_dirs = [str(d.expanduser().resolve()) for d in directories]
+        for indexed in all_paths:
+            for d in resolved_dirs:
+                if indexed == d or indexed.startswith(d.rstrip("/") + "/"):
+                    targets.add(indexed)
+                    break
+
+    if not targets:
+        click.echo("No matching indexed files found.")
+        return
+
+    click.echo(f"Will remove {len(targets)} indexed file(s):")
+    for t in sorted(targets):
+        click.echo(f"  {t}")
+
+    if not yes:
+        click.confirm("Proceed?", abort=True)
+
+    for t in targets:
+        store.remove(t)
+
+    click.echo(f"Removed {len(targets)} entries from the index.")
+
+
+@main.command()
 @click.confirmation_option(prompt="This will delete all indexed data. Continue?")
 @click.pass_context
 def reset(ctx: click.Context) -> None:
