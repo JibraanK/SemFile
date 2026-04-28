@@ -1,7 +1,10 @@
 """Indexing pipeline: discover files, embed, and store."""
 
+import concurrent.futures
 import logging
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from semfile.config import Config, WatchDirectory
@@ -12,6 +15,33 @@ from semfile.thumbnails.generator import generate_thumbnail
 
 logger = logging.getLogger(__name__)
 
+# Concurrency tuned for the Gemini API limits (100 req/min peak, 1000 req/day)
+# and an 8GB M1 Air: more workers means more files held in memory at once.
+DEFAULT_INDEX_WORKERS = 4
+DEFAULT_RATE_LIMIT_PER_MINUTE = 90  # 10% headroom under the 100 RPM peak
+DAILY_REQUEST_LIMIT = 1000
+
+
+class _RateLimiter:
+    """Sliding-window rate limiter shared across indexer worker threads."""
+
+    def __init__(self, max_per_minute: int):
+        self._max = max_per_minute
+        self._times: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._times and now - self._times[0] >= 60.0:
+                    self._times.popleft()
+                if len(self._times) < self._max:
+                    self._times.append(now)
+                    return
+                wait = 60.0 - (now - self._times[0])
+            time.sleep(max(0.05, wait))
+
 
 class Indexer:
     """Indexes files by scanning directories, generating embeddings, and storing them."""
@@ -21,10 +51,14 @@ class Indexer:
         config: Config,
         provider: EmbeddingProvider,
         store: ChromaStore,
+        max_workers: int = DEFAULT_INDEX_WORKERS,
+        rate_limit_per_minute: int = DEFAULT_RATE_LIMIT_PER_MINUTE,
     ):
         self.config = config
         self.provider = provider
         self.store = store
+        self._max_workers = max_workers
+        self._rate_limiter = _RateLimiter(rate_limit_per_minute)
 
     def index_all(self, file_types: set[str] | None = None) -> dict[str, int]:
         """Index all configured watch directories. Returns stats."""
@@ -59,45 +93,86 @@ class Indexer:
     def _index_files(
         self, files: list[tuple[Path, str, str]], stats: dict[str, int]
     ) -> None:
-        """Embed and store files, skipping unchanged ones."""
-        for i, (file_path, file_type, mime_type) in enumerate(files, 1):
+        """Embed and store files concurrently, skipping unchanged ones."""
+        todo: list[tuple[Path, str, str, float]] = []
+        for file_path, file_type, mime_type in files:
             try:
-                path_str = str(file_path)
                 mtime = file_path.stat().st_mtime
+            except OSError:
+                logger.error("Failed to stat %s", file_path, exc_info=True)
+                stats["failed"] += 1
+                continue
 
-                # Check if already indexed and unchanged
-                stored_mtime = self.store.get_modified_at(path_str)
-                if stored_mtime is not None and abs(stored_mtime - mtime) < 1.0:
-                    stats["skipped"] += 1
+            stored_mtime = self.store.get_modified_at(str(file_path))
+            if stored_mtime is not None and abs(stored_mtime - mtime) < 1.0:
+                stats["skipped"] += 1
+                continue
+
+            todo.append((file_path, file_type, mime_type, mtime))
+
+        if not todo:
+            return
+
+        total = len(todo)
+        if total > DAILY_REQUEST_LIMIT:
+            logger.warning(
+                "%d files queued but Gemini daily limit is %d requests/day; "
+                "expect some failures past the cap.",
+                total,
+                DAILY_REQUEST_LIMIT,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix="semfile-index",
+        ) as pool:
+            futures = {
+                pool.submit(self._embed_one, idx, total, task): task
+                for idx, task in enumerate(todo, 1)
+            }
+
+            for future in concurrent.futures.as_completed(futures):
+                file_path, file_type, mime_type, mtime = futures[future]
+                try:
+                    embedding, thumbnail_path = future.result()
+                except Exception:
+                    logger.error("Failed to embed %s", file_path, exc_info=True)
+                    stats["failed"] += 1
                     continue
 
-                # Generate embedding
-                logger.info("[%d/%d] Embedding: %s", i, len(files), file_path.name)
-                embedding = self.provider.embed_file(file_path, mime_type)
+                try:
+                    record = FileRecord(
+                        file_path=str(file_path),
+                        parent_dir=str(file_path.parent),
+                        filename=file_path.name,
+                        file_type=file_type,
+                        mime_type=mime_type,
+                        file_size=file_path.stat().st_size,
+                        modified_at=mtime,
+                        indexed_at=time.time(),
+                        thumbnail_path=thumbnail_path,
+                    )
+                    self.store.add(record, embedding)
+                    stats["indexed"] += 1
+                except Exception:
+                    logger.error("Failed to store %s", file_path, exc_info=True)
+                    stats["failed"] += 1
 
-                # Generate thumbnail
-                thumbnail_path = generate_thumbnail(
-                    file_path, file_type, self.config.thumbnail_dir
-                )
-
-                # Store in vector DB
-                record = FileRecord(
-                    file_path=path_str,
-                    parent_dir=str(file_path.parent),
-                    filename=file_path.name,
-                    file_type=file_type,
-                    mime_type=mime_type,
-                    file_size=file_path.stat().st_size,
-                    modified_at=mtime,
-                    indexed_at=time.time(),
-                    thumbnail_path=thumbnail_path,
-                )
-                self.store.add(record, embedding)
-                stats["indexed"] += 1
-
-            except Exception:
-                logger.error("Failed to index %s", file_path, exc_info=True)
-                stats["failed"] += 1
+    def _embed_one(
+        self,
+        idx: int,
+        total: int,
+        task: tuple[Path, str, str, float],
+    ) -> tuple[list[float], str]:
+        """Worker: rate-limited embed + thumbnail. Runs in a pool thread."""
+        file_path, file_type, mime_type, _ = task
+        self._rate_limiter.acquire()
+        logger.info("[%d/%d] Embedding: %s", idx, total, file_path.name)
+        embedding = self.provider.embed_file(file_path, mime_type)
+        thumbnail_path = generate_thumbnail(
+            file_path, file_type, self.config.thumbnail_dir
+        )
+        return embedding, thumbnail_path
 
     def _cleanup_removed(
         self, current_files: list[tuple[Path, str, str]], stats: dict[str, int]
