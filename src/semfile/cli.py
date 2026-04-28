@@ -215,6 +215,16 @@ def status(ctx: click.Context) -> None:
             click.echo(f"  {wd.path} [{exts}]")
 
 
+@main.command()
+@click.option("--port", default=19532, help="Port to listen on.")
+@click.option("--host", default="127.0.0.1", help="Host to bind to.")
+def serve(port: int, host: str) -> None:
+    """Start the HTTP API server (for Raycast)."""
+    import uvicorn
+    click.echo(f"Starting SemFile server on http://{host}:{port}")
+    uvicorn.run("semfile.server:app", host=host, port=port, log_level="info")
+
+
 @main.command("config")
 @click.pass_context
 def show_config(ctx: click.Context) -> None:
