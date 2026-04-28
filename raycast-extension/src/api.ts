@@ -11,6 +11,7 @@ export interface SearchResultItem {
   mime_type: string;
   file_size: number;
   similarity: number;
+  rerank_score: number | null;
   thumbnail_url: string | null;
 }
 
@@ -18,6 +19,7 @@ export interface SearchResponse {
   results: SearchResultItem[];
   query: string;
   count: number;
+  reranked: boolean;
 }
 
 export interface StatusResponse {
@@ -38,7 +40,7 @@ function getBaseUrl(): string {
 
 export async function searchFiles(
   query: string,
-  options?: { type?: string; limit?: number }
+  options?: { type?: string; limit?: number; rerank?: boolean; rerankTopN?: number }
 ): Promise<SearchResponse> {
   const baseUrl = getBaseUrl();
   const params = new URLSearchParams({ q: query });
@@ -48,10 +50,23 @@ export async function searchFiles(
   if (options?.limit) {
     params.set("limit", String(options.limit));
   }
+  if (options?.rerank) {
+    params.set("rerank", "true");
+    if (options.rerankTopN) {
+      params.set("rerank_top_n", String(options.rerankTopN));
+    }
+  }
 
   const response = await fetch(`${baseUrl}/search?${params}`);
   if (!response.ok) {
-    throw new Error(`Server error: ${response.status}`);
+    let detail = `Server error: ${response.status}`;
+    try {
+      const body = (await response.json()) as { error?: string };
+      if (body?.error) detail = body.error;
+    } catch {
+      // ignore non-JSON bodies
+    }
+    throw new Error(detail);
   }
   return (await response.json()) as SearchResponse;
 }

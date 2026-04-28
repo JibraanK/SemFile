@@ -36,8 +36,19 @@ def _get_state() -> dict:
             provider=provider,
             store=store,
             searcher=searcher,
+            reranker=None,
         )
     return _state
+
+
+def _get_reranker(state: dict):
+    """Lazy-initialize and cache the Gemini reranker."""
+    if state.get("reranker") is None:
+        from semfile.rerank.gemini import GeminiReranker
+
+        state["reranker"] = GeminiReranker()
+        state["searcher"].reranker = state["reranker"]
+    return state["reranker"]
 
 
 @app.get("/search")
@@ -46,17 +57,26 @@ def search(
     type: list[str] | None = Query(None, description="File type filter"),
     dir: list[str] | None = Query(None, description="Directory filter"),
     limit: int = Query(20, ge=1, le=100),
+    rerank: bool = Query(False, description="Run multimodal reranker over candidates"),
+    rerank_top_n: int = Query(20, ge=1, le=100, description="Candidate pool size when reranking"),
 ) -> dict:
     """Semantic search across indexed files."""
     state = _get_state()
+    if rerank:
+        try:
+            _get_reranker(state)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     results = state["searcher"].search(
         query=q,
         limit=limit,
         file_types=type,
         directories=dir,
+        rerank=rerank,
+        rerank_top_n=rerank_top_n,
     )
 
-    config = state["config"]
     return {
         "results": [
             {
@@ -66,6 +86,7 @@ def search(
                 "mime_type": r.mime_type,
                 "file_size": r.file_size,
                 "similarity": round(1 - r.distance, 4),
+                "rerank_score": r.rerank_score,
                 "thumbnail_url": (
                     f"/thumbnails/{Path(r.thumbnail_path).name}"
                     if r.thumbnail_path
@@ -76,6 +97,7 @@ def search(
         ],
         "query": q,
         "count": len(results),
+        "reranked": rerank,
     }
 
 

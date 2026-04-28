@@ -10,11 +10,14 @@ const FILE_TYPE_ICONS: Record<string, { icon: Icon; color: Color }> = {
   text: { icon: Icon.Text, color: Color.SecondaryText },
 };
 
+const RERANK_TOP_N = 20;
+
 export default function SearchCommand() {
   const [results, setResults] = useState<SearchResultItem[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [searchText, setSearchText] = useState("");
   const [fileTypeFilter, setFileTypeFilter] = useState("all");
+  const [rerank, setRerank] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -27,12 +30,15 @@ export default function SearchCommand() {
       return;
     }
 
+    const delay = rerank ? 600 : 300;
     debounceRef.current = setTimeout(async () => {
       setIsLoading(true);
       try {
         const response = await searchFiles(searchText, {
           type: fileTypeFilter,
           limit: 30,
+          rerank,
+          rerankTopN: RERANK_TOP_N,
         });
         setResults(response.results);
       } catch (error) {
@@ -45,18 +51,43 @@ export default function SearchCommand() {
       } finally {
         setIsLoading(false);
       }
-    }, 300);
+    }, delay);
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [searchText, fileTypeFilter]);
+  }, [searchText, fileTypeFilter, rerank]);
+
+  const toggleRerank = () => {
+    const next = !rerank;
+    setRerank(next);
+    showToast({
+      style: Toast.Style.Success,
+      title: next ? "Rerank on" : "Rerank off",
+      message: next ? "Multimodal Gemini rerank applied to top candidates" : "Using vector similarity only",
+    });
+  };
+
+  const placeholder = rerank
+    ? "Describe what you're looking for... (Rerank on)"
+    : "Describe what you're looking for...";
+
+  const globalActions = (
+    <ActionPanel.Section>
+      <Action
+        title={rerank ? "Disable Rerank" : "Enable Rerank"}
+        icon={rerank ? Icon.StarDisabled : Icon.Stars}
+        shortcut={{ modifiers: ["cmd"], key: "r" }}
+        onAction={toggleRerank}
+      />
+    </ActionPanel.Section>
+  );
 
   return (
     <List
       isLoading={isLoading}
       onSearchTextChange={setSearchText}
-      searchBarPlaceholder="Describe what you're looking for..."
+      searchBarPlaceholder={placeholder}
       isShowingDetail
       throttle
       searchBarAccessory={
@@ -71,21 +102,45 @@ export default function SearchCommand() {
       }
     >
       {!searchText.trim() ? (
-        <List.EmptyView icon={Icon.MagnifyingGlass} title="Type to search" description="Describe what you're looking for in natural language" />
+        <List.EmptyView
+          icon={Icon.MagnifyingGlass}
+          title="Type to search"
+          description={
+            rerank
+              ? "Rerank is on — results use a multimodal second pass (Cmd+R to toggle)"
+              : "Describe what you're looking for in natural language (Cmd+R to toggle rerank)"
+          }
+          actions={<ActionPanel>{globalActions}</ActionPanel>}
+        />
       ) : results.length === 0 && !isLoading ? (
-        <List.EmptyView icon={Icon.XMarkCircle} title="No results" description="Try a different search query" />
+        <List.EmptyView
+          icon={Icon.XMarkCircle}
+          title="No results"
+          description="Try a different search query"
+          actions={<ActionPanel>{globalActions}</ActionPanel>}
+        />
       ) : (
-        results.map((item, index) => {
+        results.map((item) => {
           const typeInfo = FILE_TYPE_ICONS[item.file_type] || { icon: Icon.Document, color: Color.SecondaryText };
           const thumbnailUrl = getThumbnailUrl(item.thumbnail_url);
+          const subtitle =
+            item.rerank_score !== null && item.rerank_score !== undefined
+              ? `★ ${item.rerank_score.toFixed(1)} · ${(item.similarity * 100).toFixed(0)}%`
+              : `${(item.similarity * 100).toFixed(0)}%`;
+
+          const accessories: List.Item.Accessory[] = [];
+          if (rerank) {
+            accessories.push({ icon: { source: Icon.Stars, tintColor: Color.Yellow }, tooltip: "Reranked" });
+          }
+          accessories.push({ tag: { value: item.file_type, color: typeInfo.color } });
 
           return (
             <List.Item
               key={item.file_path}
               icon={{ source: typeInfo.icon, tintColor: typeInfo.color }}
               title={item.filename}
-              subtitle={`${(item.similarity * 100).toFixed(0)}%`}
-              accessories={[{ tag: { value: item.file_type, color: typeInfo.color } }]}
+              subtitle={subtitle}
+              accessories={accessories}
               detail={
                 <List.Item.Detail
                   markdown={
@@ -99,6 +154,12 @@ export default function SearchCommand() {
                       <List.Item.Detail.Metadata.Label title="Type" text={item.file_type} />
                       <List.Item.Detail.Metadata.Label title="Size" text={formatBytes(item.file_size)} />
                       <List.Item.Detail.Metadata.Label title="Similarity" text={`${(item.similarity * 100).toFixed(1)}%`} />
+                      {item.rerank_score !== null && item.rerank_score !== undefined && (
+                        <List.Item.Detail.Metadata.Label
+                          title="Rerank Score"
+                          text={`${item.rerank_score.toFixed(2)} / 10`}
+                        />
+                      )}
                       <List.Item.Detail.Metadata.Separator />
                       <List.Item.Detail.Metadata.Label title="Path" text={item.file_path} />
                     </List.Item.Detail.Metadata>
@@ -111,6 +172,7 @@ export default function SearchCommand() {
                   <Action.ShowInFinder path={item.file_path} />
                   <Action.CopyToClipboard title="Copy Path" content={item.file_path} />
                   <Action.Open title="Open Containing Folder" target={item.file_path.substring(0, item.file_path.lastIndexOf("/"))} />
+                  {globalActions}
                 </ActionPanel>
               }
             />
