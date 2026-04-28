@@ -11,6 +11,7 @@ from semfile.config import (
     Config,
     WatchDirectory,
     create_default_config,
+    get_mime_type,
     load_config,
     DEFAULT_CONFIG_PATH,
 )
@@ -67,16 +68,16 @@ def main(ctx: click.Context, config_path: str | None, verbose: bool) -> None:
 
 
 @main.command()
-@click.option("--path", "target_path", default=None, help="Index a specific directory or file.")
+@click.option("--path", "target_paths", multiple=True, help="Index a specific directory or file. Repeatable.")
 @click.option("--type", "file_types", multiple=True, help="Only index these file types (image, video, audio, document, text).")
 @click.pass_context
-def index(ctx: click.Context, target_path: str | None, file_types: tuple[str, ...]) -> None:
+def index(ctx: click.Context, target_paths: tuple[str, ...], file_types: tuple[str, ...]) -> None:
     """Index files for semantic search."""
     config, provider, store = _load(ctx.obj["config_path"])
 
     type_filter = set(file_types) if file_types else None
 
-    if not config.watch_dirs and not target_path:
+    if not config.watch_dirs and not target_paths:
         click.echo("No watch directories configured. Use --path or edit config.")
         click.echo(f"Config file: {DEFAULT_CONFIG_PATH}")
         config_path = create_default_config()
@@ -86,9 +87,13 @@ def index(ctx: click.Context, target_path: str | None, file_types: tuple[str, ..
 
     indexer = Indexer(config, provider, store)
 
-    if target_path:
-        click.echo(f"Indexing: {target_path}")
-        stats = indexer.index_path(Path(target_path), file_types=type_filter)
+    if target_paths:
+        stats = {"scanned": 0, "indexed": 0, "skipped": 0, "failed": 0, "removed": 0}
+        for target_path in target_paths:
+            click.echo(f"Indexing: {target_path}")
+            run_stats = indexer.index_path(Path(target_path), file_types=type_filter)
+            for k, v in run_stats.items():
+                stats[k] += v
     else:
         click.echo(f"Indexing {len(config.watch_dirs)} watch directories...")
         stats = indexer.index_all(file_types=type_filter)
@@ -101,26 +106,62 @@ def index(ctx: click.Context, target_path: str | None, file_types: tuple[str, ..
 
 
 @main.command()
-@click.argument("query")
+@click.argument("query", required=False)
+@click.option(
+    "--file",
+    "query_file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Search by similarity to a file (e.g., an image) instead of text.",
+)
 @click.option("--type", "file_type", multiple=True, help="Filter by file type (image, video, audio, document, text).")
 @click.option("--dir", "directories", multiple=True, help="Scope search to specific directories.")
 @click.option("--limit", default=20, help="Maximum number of results.")
 @click.pass_context
-def search(ctx: click.Context, query: str, file_type: tuple[str, ...], directories: tuple[str, ...], limit: int) -> None:
-    """Search indexed files by natural language query."""
+def search(
+    ctx: click.Context,
+    query: str | None,
+    query_file: Path | None,
+    file_type: tuple[str, ...],
+    directories: tuple[str, ...],
+    limit: int,
+) -> None:
+    """Search indexed files by natural language query or by example file."""
+    if not query and not query_file:
+        raise click.UsageError("Provide a text QUERY or --file PATH.")
+    if query and query_file:
+        raise click.UsageError("Provide either a text QUERY or --file, not both.")
+
     config, provider, store = _load(ctx.obj["config_path"])
 
     if store.count() == 0:
         click.echo("No files indexed yet. Run `semfile index` first.")
         return
 
+    types_filter = list(file_type) if file_type else None
+    dirs_filter = list(directories) if directories else None
+
     searcher = Searcher(provider, store)
-    results = searcher.search(
-        query=query,
-        limit=limit,
-        file_types=list(file_type) if file_type else None,
-        directories=list(directories) if directories else None,
-    )
+    if query_file:
+        mime = get_mime_type(query_file.suffix)
+        if not mime:
+            raise click.UsageError(
+                f"Unsupported file type for --file: {query_file.suffix}"
+            )
+        results = searcher.search_by_file(
+            file_path=query_file,
+            mime_type=mime,
+            limit=limit,
+            file_types=types_filter,
+            directories=dirs_filter,
+        )
+    else:
+        results = searcher.search(
+            query=query,
+            limit=limit,
+            file_types=types_filter,
+            directories=dirs_filter,
+        )
 
     if not results:
         click.echo("No results found.")
