@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import logging
+import tempfile
 import threading
 import time
 from collections import deque
@@ -12,6 +13,7 @@ from semfile.embeddings.base import EmbeddingProvider
 from semfile.indexer.scanner import scan_directory, scan_path
 from semfile.store.chromadb_store import ChromaStore, FileRecord
 from semfile.thumbnails.generator import generate_thumbnail
+from semfile.video.chunker import CHUNK_THRESHOLD, chunk_video, probe_duration
 
 logger = logging.getLogger(__name__)
 
@@ -134,25 +136,37 @@ class Indexer:
             for future in concurrent.futures.as_completed(futures):
                 file_path, file_type, mime_type, mtime = futures[future]
                 try:
-                    embedding, thumbnail_path = future.result()
+                    chunk_results, thumbnail_path = future.result()
                 except Exception:
                     logger.error("Failed to embed %s", file_path, exc_info=True)
                     stats["failed"] += 1
                     continue
 
                 try:
-                    record = FileRecord(
-                        file_path=str(file_path),
-                        parent_dir=str(file_path.parent),
-                        filename=file_path.name,
-                        file_type=file_type,
-                        mime_type=mime_type,
-                        file_size=file_path.stat().st_size,
-                        modified_at=mtime,
-                        indexed_at=time.time(),
-                        thumbnail_path=thumbnail_path,
-                    )
-                    self.store.add(record, embedding)
+                    path_str = str(file_path)
+                    # Drop any prior records first; for chunked videos the
+                    # chunk count may differ between runs, so plain upsert
+                    # would leave stale chunks behind.
+                    self.store.remove(path_str)
+                    file_size = file_path.stat().st_size
+                    indexed_at = time.time()
+                    total_chunks = len(chunk_results)
+                    for embedding, chunk_index, chunk_start in chunk_results:
+                        record = FileRecord(
+                            file_path=path_str,
+                            parent_dir=str(file_path.parent),
+                            filename=file_path.name,
+                            file_type=file_type,
+                            mime_type=mime_type,
+                            file_size=file_size,
+                            modified_at=mtime,
+                            indexed_at=indexed_at,
+                            thumbnail_path=thumbnail_path,
+                            chunk_index=chunk_index,
+                            chunk_start_seconds=chunk_start,
+                            total_chunks=total_chunks,
+                        )
+                        self.store.add(record, embedding)
                     stats["indexed"] += 1
                 except Exception:
                     logger.error("Failed to store %s", file_path, exc_info=True)
@@ -163,16 +177,46 @@ class Indexer:
         idx: int,
         total: int,
         task: tuple[Path, str, str, float],
-    ) -> tuple[list[float], str]:
-        """Worker: rate-limited embed + thumbnail. Runs in a pool thread."""
+    ) -> tuple[list[tuple[list[float], int, float]], str]:
+        """Worker: rate-limited embed + thumbnail. Runs in a pool thread.
+
+        Returns ([(embedding, chunk_index, chunk_start_seconds), ...], thumbnail_path).
+        Non-chunked files yield a single-element list with chunk_index=0.
+        Long videos are split via ffmpeg and each chunk acquires the rate
+        limiter independently before its embedding call.
+        """
         file_path, file_type, mime_type, _ = task
-        self._rate_limiter.acquire()
-        logger.info("[%d/%d] Embedding: %s", idx, total, file_path.name)
-        embedding = self.provider.embed_file(file_path, mime_type)
         thumbnail_path = generate_thumbnail(
             file_path, file_type, self.config.thumbnail_dir
         )
-        return embedding, thumbnail_path
+
+        duration: float | None = None
+        if file_type == "video":
+            duration = probe_duration(file_path)
+
+        if duration is not None and duration > CHUNK_THRESHOLD:
+            with tempfile.TemporaryDirectory(prefix="semfile-chunks-") as td:
+                segments = chunk_video(file_path, Path(td))
+                logger.info(
+                    "[%d/%d] Chunking %s: %.1fs -> %d segments",
+                    idx, total, file_path.name, duration, len(segments),
+                )
+                results: list[tuple[list[float], int, float]] = []
+                for chunk_index, (chunk_path, chunk_start) in enumerate(segments):
+                    self._rate_limiter.acquire()
+                    logger.info(
+                        "[%d/%d] Embedding %s chunk %d/%d (start %.1fs)",
+                        idx, total, file_path.name,
+                        chunk_index + 1, len(segments), chunk_start,
+                    )
+                    embedding = self.provider.embed_file(chunk_path, mime_type)
+                    results.append((embedding, chunk_index, chunk_start))
+                return results, thumbnail_path
+
+        self._rate_limiter.acquire()
+        logger.info("[%d/%d] Embedding: %s", idx, total, file_path.name)
+        embedding = self.provider.embed_file(file_path, mime_type)
+        return [(embedding, 0, 0.0)], thumbnail_path
 
     def _cleanup_removed(
         self, current_files: list[tuple[Path, str, str]], stats: dict[str, int]
