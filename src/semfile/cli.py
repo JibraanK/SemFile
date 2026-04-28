@@ -171,7 +171,15 @@ def search(
     for i, r in enumerate(results, 1):
         similarity = 1 - r.distance  # cosine distance to similarity
         size_mb = r.file_size / 1_000_000
-        click.echo(f"  {i}. [{r.file_type}] {r.filename}")
+        if r.total_chunks > 1:
+            s = int(r.chunk_start_seconds)
+            ts = f"{s // 60:02d}:{s % 60:02d}"
+            click.echo(
+                f"  {i}. [{r.file_type}] {r.filename}  "
+                f"(chunk {r.chunk_index + 1}/{r.total_chunks} @ {ts})"
+            )
+        else:
+            click.echo(f"  {i}. [{r.file_type}] {r.filename}")
         click.echo(f"     Path: {r.file_path}")
         click.echo(f"     Similarity: {similarity:.3f}  Size: {size_mb:.1f} MB")
         click.echo()
