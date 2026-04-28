@@ -46,6 +46,7 @@ class SearchResult:
     chunk_index: int = 0
     chunk_start_seconds: float = 0.0
     total_chunks: int = 1
+    rerank_score: float | None = None
 
 
 def _file_id(file_path: str, chunk_index: int = 0) -> str:
