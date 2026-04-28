@@ -19,6 +19,12 @@
       "title": "Index Status",
       "description": "View index statistics and storage usage",
       "mode": "view"
+    },
+    {
+      "name": "index-files",
+      "title": "Index Files",
+      "description": "Run a SemFile index job on a folder or all watch directories",
+      "mode": "view"
     }
   ],
   "preferences": [

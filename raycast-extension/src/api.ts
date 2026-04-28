@@ -40,7 +40,13 @@ function getBaseUrl(): string {
 
 export async function searchFiles(
   query: string,
-  options?: { type?: string; limit?: number; rerank?: boolean; rerankTopN?: number }
+  options?: {
+    type?: string;
+    limit?: number;
+    rerank?: boolean;
+    rerankTopN?: number;
+    dirs?: string[];
+  }
 ): Promise<SearchResponse> {
   const baseUrl = getBaseUrl();
   const params = new URLSearchParams({ q: query });
@@ -56,17 +62,15 @@ export async function searchFiles(
       params.set("rerank_top_n", String(options.rerankTopN));
     }
   }
+  if (options?.dirs?.length) {
+    for (const d of options.dirs) {
+      params.append("dir", d);
+    }
+  }
 
   const response = await fetch(`${baseUrl}/search?${params}`);
   if (!response.ok) {
-    let detail = `Server error: ${response.status}`;
-    try {
-      const body = (await response.json()) as { error?: string };
-      if (body?.error) detail = body.error;
-    } catch {
-      // ignore non-JSON bodies
-    }
-    throw new Error(detail);
+    throw new Error(await readError(response));
   }
   return (await response.json()) as SearchResponse;
 }
@@ -75,9 +79,76 @@ export async function getStatus(): Promise<StatusResponse> {
   const baseUrl = getBaseUrl();
   const response = await fetch(`${baseUrl}/status`);
   if (!response.ok) {
-    throw new Error(`Server error: ${response.status}`);
+    throw new Error(await readError(response));
   }
   return (await response.json()) as StatusResponse;
+}
+
+export interface IndexStatus {
+  running: boolean;
+  started_at: number | null;
+  finished_at: number | null;
+  path: string | null;
+  file_types: string[] | null;
+  stats: {
+    scanned: number;
+    indexed: number;
+    skipped: number;
+    failed: number;
+    removed: number;
+  } | null;
+  error: string | null;
+  count_at_start: number | null;
+  count: number;
+}
+
+export interface TriggerIndexResponse {
+  started: boolean;
+  started_at: number;
+}
+
+export async function triggerIndex(options?: {
+  path?: string;
+  fileTypes?: string[];
+}): Promise<TriggerIndexResponse> {
+  const baseUrl = getBaseUrl();
+  const body: Record<string, unknown> = {};
+  if (options?.path) body.path = options.path;
+  if (options?.fileTypes?.length) body.file_types = options.fileTypes;
+
+  const response = await fetch(`${baseUrl}/index`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (response.status === 409) {
+    const err = new Error("Index already running");
+    (err as Error & { code?: number }).code = 409;
+    throw err;
+  }
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return (await response.json()) as TriggerIndexResponse;
+}
+
+export async function getIndexStatus(): Promise<IndexStatus> {
+  const baseUrl = getBaseUrl();
+  const response = await fetch(`${baseUrl}/index/status`);
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  return (await response.json()) as IndexStatus;
+}
+
+async function readError(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: string };
+    if (body?.error) return body.error;
+  } catch {
+    // ignore non-JSON bodies
+  }
+  return `Server error: ${response.status}`;
 }
 
 export function getThumbnailUrl(thumbnailUrl: string | null): string | undefined {

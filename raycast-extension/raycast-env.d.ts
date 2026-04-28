@@ -20,6 +20,8 @@ declare namespace Preferences {
   export type Search = ExtensionPreferences & {}
   /** Preferences accessible in the `status` command */
   export type Status = ExtensionPreferences & {}
+  /** Preferences accessible in the `index-files` command */
+  export type IndexFiles = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -27,5 +29,7 @@ declare namespace Arguments {
   export type Search = {}
   /** Arguments passed to the `status` command */
   export type Status = {}
+  /** Arguments passed to the `index-files` command */
+  export type IndexFiles = {}
 }
 

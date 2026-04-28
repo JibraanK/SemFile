@@ -1,6 +1,8 @@
 """FastAPI server for Raycast and other HTTP clients."""
 
 import logging
+import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -133,24 +135,93 @@ def thumbnail(filename: str) -> FileResponse:
     return FileResponse(thumb_path, media_type="image/jpeg")
 
 
-@app.post("/index")
-def trigger_index(body: dict | None = None) -> dict:
-    """Trigger indexing (synchronous for now)."""
+_index_lock = threading.Lock()
+
+
+def _empty_job() -> dict:
+    return {
+        "running": False,
+        "started_at": None,
+        "finished_at": None,
+        "path": None,
+        "file_types": None,
+        "stats": None,
+        "error": None,
+        "count_at_start": None,
+    }
+
+
+def _run_index_job(path: str | None, file_types: list[str] | None) -> None:
     from semfile.indexer.indexer import Indexer
 
     state = _get_state()
+    job = state["index_job"]
     indexer = Indexer(state["config"], state["provider"], state["store"])
-
-    path = body.get("path") if body else None
-    file_types = body.get("file_types") if body else None
     type_filter = set(file_types) if file_types else None
 
-    if path:
-        stats = indexer.index_path(Path(path), file_types=type_filter)
-    else:
-        stats = indexer.index_all(file_types=type_filter)
+    try:
+        if path:
+            stats = indexer.index_path(Path(path), file_types=type_filter)
+        else:
+            stats = indexer.index_all(file_types=type_filter)
+        job["stats"] = stats
+    except Exception as exc:
+        logger.exception("Index job failed")
+        job["error"] = str(exc)
+    finally:
+        job["finished_at"] = time.time()
+        job["running"] = False
 
-    return stats
+
+@app.post("/index")
+def trigger_index(body: dict | None = None) -> JSONResponse:
+    """Kick off an index job in the background. Returns immediately."""
+    state = _get_state()
+    state.setdefault("index_job", _empty_job())
+    job = state["index_job"]
+
+    with _index_lock:
+        if job["running"]:
+            return JSONResponse(
+                {"error": "index already running", "started_at": job["started_at"]},
+                status_code=409,
+            )
+
+        path = body.get("path") if body else None
+        file_types = body.get("file_types") if body else None
+
+        job.update(
+            running=True,
+            started_at=time.time(),
+            finished_at=None,
+            path=path,
+            file_types=file_types,
+            stats=None,
+            error=None,
+            count_at_start=state["store"].count(),
+        )
+
+    thread = threading.Thread(
+        target=_run_index_job,
+        args=(path, file_types),
+        daemon=True,
+    )
+    thread.start()
+
+    return JSONResponse({"started": True, "started_at": job["started_at"]})
+
+
+@app.get("/index/status")
+def index_status() -> dict:
+    """Current index-job status plus the store's live file count."""
+    state = _get_state()
+    state.setdefault("index_job", _empty_job())
+    job = state["index_job"]
+
+    return {
+        **job,
+        "count": state["store"].count(),
+    }
 
 
 def _dir_size(path: Path) -> int:
